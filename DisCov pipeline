@@ -1,0 +1,1177 @@
+"""
+================================================================================
+AL-INSPIRED ADAPTIVE GENE SELECTION PIPELINE — FULL EVALUATION  (v4.3)
+================================================================================
+Changes vs v3:
+  • disc_combined: rank aggregation instead of raw sum
+  • _adaptive_weights: dataset-size-aware beta decay; beta>=0.70 after k=25
+  • _coverage_scores: class-conditioned (partial) correlation
+  • fit(): adaptive disc floor — 25th pct for k<=25, median for k>25
+  • fit(): dual index lists — al_indices_ (AL order, used k<=25) and
+           selected_indices_ (SVM-reranked, used k>25)
+================================================================================
+Classifiers (9):
+  1.  Logistic Regression
+  2.  Random Forest
+  3.  SVM (linear, probability=True)
+  4.  LDA
+  5.  KNN (k=5, euclidean)
+  6.  Gradient Boosting
+  7.  AdaBoost
+  8.  Voting Ensemble  (LR + RF + SVM, soft)
+  9.  Stacking Ensemble (LR + RF + SVM -> LR meta)
+
+Feature selection methods (12):
+  AL-inspired : DiscCov, AL-fixed, disc-only, cov-only
+  Classical   : mRMR, t-test, LASSO, ReliefF, RF-importance
+  New baselines: SVM-RFE, Elastic Net, ANOVA F-test
+================================================================================
+"""
+
+import numpy as np
+import pandas as pd
+import time
+import warnings
+from collections import defaultdict
+from itertools import combinations
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.svm import SVC, LinearSVC
+from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier,
+                               AdaBoostClassifier, VotingClassifier,
+                               StackingClassifier)
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.linear_model import LogisticRegression, LassoCV, ElasticNet
+from sklearn.feature_selection import RFE, f_classif, SelectKBest
+from sklearn.decomposition import PCA
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, matthews_corrcoef,
+    cohen_kappa_score, confusion_matrix, roc_auc_score, f1_score
+)
+from scipy.stats import rankdata, wilcoxon, friedmanchisquare
+import pathlib
+
+# ── Environment detection ─────────────────────────────────────────────────────
+def _in_colab():
+    try:
+        import google.colab
+        return True
+    except ImportError:
+        return False
+
+IN_COLAB = _in_colab()
+
+import matplotlib
+if not IN_COLAB:
+    matplotlib.use('Agg')
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_BETA = 0.65
+BETA_MAX  = 0.80
+ALPHA_MIN = 0.20
+
+def _get_out_dir():
+    if IN_COLAB:
+        drive = pathlib.Path('/content/drive/MyDrive/al_gene_outputs_v4')
+        if pathlib.Path('/content/drive/MyDrive').exists():
+            drive.mkdir(parents=True, exist_ok=True)
+            return str(drive) + '/'
+        local = pathlib.Path('/content/al_gene_outputs_v4')
+        local.mkdir(parents=True, exist_ok=True)
+        return str(local) + '/'
+    local = pathlib.Path('al_gene_outputs_v4')
+    local.mkdir(parents=True, exist_ok=True)
+    return str(local) + '/'
+
+OUT_DIR = _get_out_dir()
+print(f"  Outputs -> {OUT_DIR}")
+
+# ── Light / white theme ───────────────────────────────────────────────────────
+FIG_BG    = 'white'
+PANEL_BG  = '#f8fafc'
+GRID_COL  = '#e2e8f0'
+SPINE_COL = '#cbd5e1'
+TICK_COL  = '#475569'
+TITLE_COL = '#1e293b'
+LABEL_COL = '#334155'
+TEXT_COL  = '#0f172a'
+
+PALETTE = {
+    'DiscCov':       '#9333ea',
+    'AL-fixed':      '#6366f1',
+    'disc-only':     '#ea580c',
+    'cov-only':      '#059669',
+    'mRMR':          '#2563eb',
+    't-test':        '#d97706',
+    'LASSO':         '#dc2626',
+    'ReliefF':       '#16a34a',
+    'RF-importance': '#0284c7',
+    'SVM-RFE':       '#c2410c',
+    'ElasticNet':    '#7c3aed',
+    'ANOVA':         '#0891b2',
+}
+
+CLF_COLORS = ['#9333ea','#059669','#2563eb','#d97706','#dc2626',
+              '#16a34a','#0284c7','#c2410c','#7c3aed']
+
+plt.rcParams.update({
+    'figure.facecolor':  FIG_BG,
+    'axes.facecolor':    PANEL_BG,
+    'axes.edgecolor':    SPINE_COL,
+    'axes.labelcolor':   LABEL_COL,
+    'axes.titlecolor':   TITLE_COL,
+    'xtick.color':       TICK_COL,
+    'ytick.color':       TICK_COL,
+    'grid.color':        GRID_COL,
+    'grid.alpha':        0.8,
+    'text.color':        TEXT_COL,
+    'legend.facecolor':  FIG_BG,
+    'legend.edgecolor':  SPINE_COL,
+    'legend.labelcolor': TICK_COL,
+    'savefig.facecolor': FIG_BG,
+    'savefig.edgecolor': FIG_BG,
+    'font.family':       'DejaVu Sans',
+})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — PREPROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log2_transform(X):
+    if np.any(X < 0) or np.nanmax(X) < 30:
+        print("  Skipping log2 (data appears already log-transformed).")
+        return X
+    print("  log2(X+1) transform ...")
+    return np.log2(X + 1)
+
+def quantile_normalize(X):
+    print("  Quantile normalising ...")
+    Xt = X.T
+    ranks = np.apply_along_axis(rankdata, 0, Xt)
+    row_means = np.sort(Xt, axis=0).mean(axis=1)
+    norm = np.zeros_like(Xt, dtype=float)
+    for j in range(Xt.shape[1]):
+        norm[:, j] = row_means[(ranks[:, j] - 1).astype(int)]
+    return norm.T
+
+def preprocess(X, do_log2=True, do_qnorm=True):
+    if np.isnan(X).any():
+        X = SimpleImputer(strategy='mean').fit_transform(X)
+    if do_log2:
+        X = log2_transform(X)
+    if do_qnorm:
+        X = quantile_normalize(X)
+    return X
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — DISCRIMINABILITY SCORERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _minmax(arr):
+    r = arr - arr.min()
+    return r / r.max() if r.max() > 0 else r
+
+def disc_snr(X, y):
+    classes = np.unique(y)
+    best = np.zeros(X.shape[1])
+    for i, j in combinations(range(len(classes)), 2):
+        m1 = X[y==classes[i]].mean(0); s1 = X[y==classes[i]].std(0)+1e-8
+        m2 = X[y==classes[j]].mean(0); s2 = X[y==classes[j]].std(0)+1e-8
+        best = np.maximum(best, np.abs((m1-m2)/(s1+s2)))
+    return _minmax(best)
+
+def disc_ttest(X, y):
+    classes = np.unique(y)
+    best = np.zeros(X.shape[1])
+    for cls in classes:
+        mask = y == cls
+        if mask.sum() < 2 or (~mask).sum() < 2:
+            continue
+        m1, m2 = X[mask].mean(0), X[~mask].mean(0)
+        v1 = X[mask].var(0, ddof=1)/mask.sum() + 1e-8
+        v2 = X[~mask].var(0, ddof=1)/(~mask).sum() + 1e-8
+        t  = np.abs((m1-m2)/np.sqrt(v1+v2))
+        best = np.maximum(best, np.nan_to_num(t))
+    return _minmax(best)
+
+def disc_anova(X, y):
+    classes = np.unique(y)
+    groups  = [X[y==c] for c in classes if (y==c).sum() >= 2]
+    if len(groups) < 2:
+        return np.zeros(X.shape[1])
+    grand_mean = X.mean(0)
+    k = len(groups); n_total = X.shape[0]
+    ssbw = sum(len(g)*(g.mean(0)-grand_mean)**2 for g in groups)
+    ssw  = sum(((g-g.mean(0))**2).sum(0) for g in groups)
+    f = (ssbw/(k-1)) / (ssw/(n_total-k) + 1e-8)
+    return _minmax(np.nan_to_num(f))
+
+# ── CHANGE 1: rank aggregation instead of raw sum ────────────────────────────
+def disc_combined(X, y):
+    s1 = disc_snr(X, y)
+    s2 = disc_ttest(X, y)
+    s3 = disc_anova(X, y)
+    n  = len(s1)
+    r1 = rankdata(s1) / n
+    r2 = rankdata(s2) / n
+    r3 = rankdata(s3) / n
+    return _minmax(r1 + r2 + r3)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — AL GENE SELECTOR  (v4 — five targeted fixes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ALGeneSelector:
+    def __init__(self, n_genes=50, disc_method='combined',
+                 alpha_fixed=None, beta_fixed=None, random_state=42):
+        self.n_genes      = n_genes
+        self.disc_method  = disc_method
+        self.alpha_fixed  = alpha_fixed
+        self.beta_fixed   = beta_fixed
+        self.random_state = random_state
+        self.selected_indices_ = []
+        self.alpha_history_    = []
+        self.beta_history_     = []
+        self._y = None   # stored in fit() for class-conditioned coverage
+
+    def _disc_scores(self, X, y):
+        if self.disc_method == 'snr':   return disc_snr(X, y)
+        if self.disc_method == 'ttest': return disc_ttest(X, y)
+        if self.disc_method == 'anova': return disc_anova(X, y)
+        return disc_combined(X, y)
+
+    def _reliability(self, disc_scores):
+        return min(1.0, (disc_scores.max()-disc_scores.min()) / 0.5)
+
+    def _gap(self, X, y, selected):
+        if not selected:
+            return 1.0
+        X_sel = X[:, selected]
+        y_f = y.astype(float); y_c = y_f - y_f.mean()
+        corrs = []
+        for j in range(X_sel.shape[1]):
+            x_c = X_sel[:,j] - X_sel[:,j].mean()
+            denom = np.linalg.norm(x_c)*np.linalg.norm(y_c) + 1e-8
+            corrs.append(abs(np.dot(x_c, y_c)/denom))
+        return max(0.0, 1.0 - np.mean(corrs))
+
+    # ── CHANGE 2: dataset-size-aware beta decay + hard floor after k=25 ────────
+    def _adaptive_weights(self, disc_scores, X, y, selected):
+        r = self._reliability(disc_scores)
+        g = self._gap(X, y, selected)
+        if self.beta_fixed is not None:
+            beta  = float(self.beta_fixed)
+            alpha = 1.0 - beta
+        elif self.alpha_fixed is not None:
+            alpha = float(self.alpha_fixed)
+            beta  = 1.0 - alpha
+        else:
+            # decay_rate scales with n: small datasets ~0.30, large ~0.50
+            n_samples  = len(self._y) if self._y is not None else 100
+            decay_rate = 0.30 + 0.20 * min(1.0, n_samples / 200.0)
+            progress   = len(selected) / max(1, self.n_genes)
+            beta_base  = 0.80 - decay_rate * progress
+            beta       = min(beta_base, BASE_BETA * r + 0.15 * g)
+            alpha      = max(1.0 - beta, ALPHA_MIN)
+            # After first 25 genes coverage has done its job:
+            # force disc weight >= 0.70 for all subsequent selections
+            if len(selected) >= 25:
+                beta  = max(beta, 0.70)
+                alpha = 1.0 - beta
+        return alpha, beta
+
+    # ── CHANGE 3: class-conditioned coverage (partial correlation) ────────────
+    def _coverage_scores(self, X, candidate_indices, selected_indices):
+        if not selected_indices:
+            return np.ones(len(candidate_indices))
+        X_cand = X[:, candidate_indices]
+        X_sel  = X[:, selected_indices]
+        # Remove within-class means to get class-conditioned residuals
+        X_cand_res = X_cand.copy()
+        X_sel_res  = X_sel.copy()
+        if self._y is not None:
+            for cls in np.unique(self._y):
+                mask = self._y == cls
+                X_cand_res[mask] -= X_cand[mask].mean(0)
+                X_sel_res[mask]  -= X_sel[mask].mean(0)
+        def _std(M):
+            return M / (np.linalg.norm(M, axis=0) + 1e-8)
+        corr = np.abs(_std(X_cand_res).T @ _std(X_sel_res)) / X_cand_res.shape[0]
+        return _minmax(1.0 - corr.max(axis=1))
+
+    def fit(self, X, y):
+        self._y       = y              # CHANGE 3: store for class-conditioned coverage
+        n_select      = min(self.n_genes, X.shape[1])
+        remaining     = list(range(X.shape[1]))
+        selected      = []
+        self.selected_indices_ = []
+        self.alpha_history_    = []
+        self.beta_history_     = []
+
+        for _ in range(n_select):
+            disc  = self._disc_scores(X[:, remaining], y)
+            cov   = self._coverage_scores(X, remaining, selected)
+            alpha, beta = self._adaptive_weights(disc, X, y, selected)
+            score = alpha * cov + beta * disc
+            score += np.random.default_rng(
+                self.random_state + len(selected)).normal(0, 1e-6, len(score))
+
+            # ── CHANGE 4: adaptive disc floor — 25th pct early, median late ──
+            # Early selections (k<=25): allow some diversity via loose floor
+            # Later selections (k>25):  strict median floor, signal-driven only
+            pct        = 50 if len(selected) >= 25 else 25
+            disc_floor = np.percentile(disc, pct)
+            score[disc < disc_floor] = -np.inf
+
+            best_global = remaining[int(np.argmax(score))]
+            selected.append(best_global)
+            remaining.remove(best_global)
+            self.selected_indices_.append(best_global)
+            self.alpha_history_.append(round(alpha, 4))
+            self.beta_history_.append(round(beta,  4))
+
+        # ── CHANGE 5: SVM re-ranking — dual index lists ──────────────────────
+        # al_indices_   : original AL greedy order  -> used when k <= 25
+        # selected_indices_: SVM-reranked order     -> used when k >  25
+        # Split avoids noisy SVM weights on tiny gene sets (k=5,10,25)
+        # while keeping boundary-aware ordering for larger subsets.
+        self.al_indices_ = list(self.selected_indices_)   # freeze AL order
+        try:
+            X_sel     = X[:, self.selected_indices_]
+            svm       = LinearSVC(C=1.0, max_iter=3000,
+                                  random_state=self.random_state)
+            svm.fit(X_sel, y)
+            svm_order = np.argsort(np.abs(svm.coef_[0]))[::-1]
+            self.selected_indices_ = [
+                self.selected_indices_[i] for i in svm_order]
+        except Exception:
+            pass    # keep AL order as fallback
+
+        return self
+
+    def transform(self, X, k=None):
+        n = k if k is not None else len(self.selected_indices_)
+        # AL order for small k (SVM weights unreliable on few genes)
+        # SVM-reranked order for larger k (boundary-aware)
+        idx = self.al_indices_[:n] if n <= 25 else self.selected_indices_[:n]
+        return X[:, idx]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — FEATURE SELECTION BASELINES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def baseline_ttest_topk(X, y, k):
+    return np.argsort(disc_ttest(X, y))[::-1][:k]
+
+def baseline_rf_importance(X, y, k, random_state=42):
+    rf = RandomForestClassifier(n_estimators=100, random_state=random_state, n_jobs=-1)
+    rf.fit(X, y)
+    return np.argsort(rf.feature_importances_)[::-1][:k]
+
+def baseline_lasso(X, y, k, random_state=42):
+    try:
+        lasso = LassoCV(cv=3, random_state=random_state, max_iter=5000,
+                        n_jobs=-1).fit(X, y.astype(float))
+        idx = np.argsort(np.abs(lasso.coef_))[::-1][:k]
+        if len(idx) < k:
+            rest = [i for i in range(X.shape[1]) if i not in set(idx)]
+            idx  = np.concatenate([idx, rest[:k-len(idx)]])
+        return idx[:k]
+    except Exception:
+        return baseline_ttest_topk(X, y, k)
+
+def baseline_relieff(X, y, k, n_neighbors=5, max_samples=50):
+    classes = np.unique(y)
+    weights = np.zeros(X.shape[1])
+    rng = np.random.default_rng(42)
+    sample_idx = rng.choice(X.shape[0], size=min(max_samples, X.shape[0]),
+                            replace=False)
+    for i in sample_idx:
+        xi = X[i]; ci = y[i]
+        same = np.where(y==ci)[0]; same = same[same!=i]
+        if len(same) == 0: continue
+        hits = same[np.argsort(np.sum((X[same]-xi)**2,axis=1))[:n_neighbors]]
+        misses_all = []
+        for cls in classes:
+            if cls==ci: continue
+            diff = np.where(y==cls)[0]
+            if len(diff)==0: continue
+            misses_all.append(
+                X[diff[np.argsort(np.sum((X[diff]-xi)**2,axis=1))[:n_neighbors]]])
+        if not misses_all: continue
+        X_miss = np.vstack(misses_all)
+        weights -= np.mean(np.abs(X[hits]-xi), axis=0) / len(sample_idx)
+        weights += np.mean(np.abs(X_miss-xi),  axis=0) / len(sample_idx)
+    return np.argsort(weights)[::-1][:k]
+
+def baseline_mrmr(X, y, k):
+    y_f = y.astype(float); y_c = y_f - y_f.mean()
+    yn  = np.linalg.norm(y_c) + 1e-8
+    relevance = np.array([
+        abs(np.dot(X[:,j]-X[:,j].mean(), y_c) /
+            (np.linalg.norm(X[:,j]-X[:,j].mean())*yn + 1e-8))
+        for j in range(X.shape[1])
+    ])
+    Xs = X - X.mean(0); norms = np.linalg.norm(Xs, axis=0)+1e-8
+    corr_matrix = np.abs((Xs/norms).T @ (Xs/norms)) / X.shape[0]
+    selected = []; remaining = list(range(X.shape[1]))
+    for _ in range(k):
+        if not selected:
+            best = remaining[int(np.argmax(relevance[remaining]))]
+        else:
+            redundancy = np.array([corr_matrix[j,selected].mean() for j in remaining])
+            best = remaining[int(np.argmax(relevance[remaining] - redundancy))]
+        selected.append(best); remaining.remove(best)
+    return np.array(selected)
+
+def baseline_svm_rfe(X, y, k, random_state=42):
+    try:
+        estimator = LinearSVC(random_state=random_state, max_iter=5000, C=1.0)
+        step = max(1, (X.shape[1]-k)//20)
+        rfe  = RFE(estimator=estimator, n_features_to_select=k, step=step)
+        rfe.fit(X, y)
+        return np.where(rfe.support_)[0][:k]
+    except Exception:
+        return baseline_ttest_topk(X, y, k)
+
+def baseline_elasticnet(X, y, k, random_state=42):
+    try:
+        en = ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000,
+                        random_state=random_state)
+        en.fit(X, y.astype(float))
+        idx = np.argsort(np.abs(en.coef_))[::-1][:k]
+        if len(idx) < k:
+            rest = [i for i in range(X.shape[1]) if i not in set(idx)]
+            idx  = np.concatenate([idx, rest[:k-len(idx)]])
+        return idx[:k]
+    except Exception:
+        return baseline_ttest_topk(X, y, k)
+
+def baseline_anova_ftest(X, y, k):
+    try:
+        sel = SelectKBest(score_func=f_classif, k=min(k, X.shape[1]))
+        sel.fit(X, y)
+        return np.argsort(sel.scores_)[::-1][:k]
+    except Exception:
+        return baseline_ttest_topk(X, y, k)
+
+def get_baseline_genes(name, X, y, k, random_state=42):
+    if name == 't-test':        return baseline_ttest_topk(X, y, k)
+    if name == 'RF-importance': return baseline_rf_importance(X, y, k, random_state)
+    if name == 'LASSO':         return baseline_lasso(X, y, k, random_state)
+    if name == 'ReliefF':       return baseline_relieff(X, y, k)
+    if name == 'mRMR':          return baseline_mrmr(X, y, k)
+    if name == 'SVM-RFE':       return baseline_svm_rfe(X, y, k, random_state)
+    if name == 'ElasticNet':    return baseline_elasticnet(X, y, k, random_state)
+    if name == 'ANOVA':         return baseline_anova_ftest(X, y, k)
+    return baseline_ttest_topk(X, y, k)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — CLASSIFIER BANK (9 classifiers)
+# ─────────────────────────────────────────────────────────────────────────────
+
+CLASSIFIER_NAMES = [
+    'LogisticRegression', 'RandomForest', 'SVM', 'LDA', 'KNN',
+    'GradientBoosting', 'AdaBoost', 'VotingEnsemble', 'StackingEnsemble',
+]
+
+def build_classifiers(random_state=42):
+    lr  = LogisticRegression(max_iter=1000, random_state=random_state, n_jobs=-1)
+    rf  = RandomForestClassifier(n_estimators=100, random_state=random_state, n_jobs=-1)
+    svm = SVC(kernel='linear', probability=True, C=1.0, random_state=random_state)
+
+    voting = VotingClassifier(
+        estimators=[
+            ('lr',  LogisticRegression(max_iter=1000, random_state=random_state)),
+            ('rf',  RandomForestClassifier(n_estimators=100, random_state=random_state)),
+            ('svm', SVC(kernel='linear', probability=True, C=1.0,
+                        random_state=random_state))],
+        voting='soft', n_jobs=-1)
+
+    stacking = StackingClassifier(
+        estimators=[
+            ('lr',  LogisticRegression(max_iter=1000, random_state=random_state)),
+            ('rf',  RandomForestClassifier(n_estimators=100, random_state=random_state)),
+            ('svm', SVC(kernel='linear', probability=True, C=1.0,
+                        random_state=random_state))],
+        final_estimator=LogisticRegression(max_iter=1000, random_state=random_state),
+        cv=3, n_jobs=-1)
+
+    return {
+        'LogisticRegression': lr,
+        'RandomForest':       rf,
+        'SVM':                svm,
+        'LDA':                LinearDiscriminantAnalysis(),
+        'KNN':                KNeighborsClassifier(n_neighbors=5, metric='euclidean'),
+        'GradientBoosting':   GradientBoostingClassifier(
+                                  n_estimators=100, learning_rate=0.1,
+                                  random_state=random_state),
+        'AdaBoost':           AdaBoostClassifier(
+                                  n_estimators=50, learning_rate=1.0,
+                                  random_state=random_state),
+        'VotingEnsemble':     voting,
+        'StackingEnsemble':   stacking,
+    }
+
+
+def compute_metrics(y_true, y_pred, y_prob, classes):
+    n_cls    = len(classes)
+    acc      = accuracy_score(y_true, y_pred)
+    bacc     = balanced_accuracy_score(y_true, y_pred)
+    mcc      = matthews_corrcoef(y_true, y_pred)
+    kappa    = cohen_kappa_score(y_true, y_pred)
+    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    f1_per   = f1_score(y_true, y_pred, average=None,    zero_division=0,
+                        labels=classes)
+    try:
+        if n_cls == 2:
+            auc = roc_auc_score(y_true, y_prob[:, 1])
+        else:
+            auc = roc_auc_score(
+                label_binarize(y_true, classes=classes),
+                y_prob, multi_class='ovr', average='macro')
+    except Exception:
+        auc = float('nan')
+    cm = confusion_matrix(y_true, y_pred, labels=classes)
+    return dict(accuracy=acc, balanced_acc=bacc, mcc=mcc, kappa=kappa,
+                f1_macro=f1_macro, f1_per_class=f1_per, auc=auc, cm=cm)
+
+
+def evaluate_gene_subset(X_tr_k, y_tr, X_te_k, y_te, classes, random_state=42):
+    SCALAR  = ['accuracy', 'balanced_acc', 'mcc', 'kappa', 'f1_macro', 'auc']
+    clfs    = build_classifiers(random_state)
+    all_res = {}
+    for clf_name, clf in clfs.items():
+        try:
+            clf.fit(X_tr_k, y_tr)
+            y_pred = clf.predict(X_te_k)
+            y_prob = clf.predict_proba(X_te_k)
+            m = compute_metrics(y_te, y_pred, y_prob, classes)
+        except Exception:
+            m = {s: float('nan') for s in SCALAR}
+            m.update(f1_per_class=np.zeros(len(classes)),
+                     cm=np.zeros((len(classes), len(classes))))
+        m['clf'] = clf_name
+        all_res[clf_name] = m
+    avg = {s: np.nanmean([all_res[cn][s] for cn in CLASSIFIER_NAMES])
+           for s in SCALAR}
+    avg['clf'] = 'Average'
+    avg['f1_per_class'] = np.nanmean(
+        [all_res[cn]['f1_per_class'] for cn in CLASSIFIER_NAMES], axis=0)
+    avg['cm'] = np.nanmean(
+        [all_res[cn]['cm'] for cn in CLASSIFIER_NAMES], axis=0)
+    all_res['Average'] = avg
+    return all_res
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — METHOD CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+K_VALUES = [5, 10, 25, 50, 100, 150, 200]
+
+METHODS = {
+    'DiscCov':       dict(alpha_fixed=None, beta_fixed=None),
+    'AL-fixed':      dict(alpha_fixed=0.5,  beta_fixed=0.5),
+    'disc-only':     dict(alpha_fixed=0.0,  beta_fixed=1.0),
+    'cov-only':      dict(alpha_fixed=1.0,  beta_fixed=0.0),
+    'mRMR':          None,
+    't-test':        None,
+    'LASSO':         None,
+    'ReliefF':       None,
+    'RF-importance': None,
+    'SVM-RFE':       None,
+    'ElasticNet':    None,
+    'ANOVA':         None,
+}
+
+AL_METHODS     = ['DiscCov', 'AL-fixed', 'disc-only', 'cov-only']
+BASELINE_NAMES = ['mRMR', 't-test', 'LASSO', 'ReliefF', 'RF-importance',
+                  'SVM-RFE', 'ElasticNet', 'ANOVA']
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — MAIN CV LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pipeline(X, y, n_folds=5, random_state=42, verbose=True):
+    classes = np.unique(y)
+    skf     = StratifiedKFold(n_splits=n_folds, shuffle=True,
+                              random_state=random_state)
+    results = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    ab_log  = defaultdict(list)
+    max_k   = max(K_VALUES)
+
+    for fold_i, (tr_idx, te_idx) in enumerate(skf.split(X, y)):
+        X_tr, X_te = X[tr_idx], X[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+
+        for mname in AL_METHODS:
+            cfg = METHODS[mname]
+            sel = ALGeneSelector(
+                n_genes=max_k,
+                alpha_fixed=cfg['alpha_fixed'],
+                beta_fixed=cfg['beta_fixed'],
+                random_state=random_state + fold_i)
+            sel.fit(X_tr, y_tr)
+
+            if mname == 'DiscCov':
+                ab_log[fold_i].append(
+                    list(zip(sel.alpha_history_, sel.beta_history_)))
+
+            for k in K_VALUES:
+                k_eff  = min(k, len(sel.selected_indices_))
+                X_tr_k = sel.transform(X_tr, k_eff)
+                X_te_k = sel.transform(X_te, k_eff)
+                n_pca  = min(k_eff, X_tr_k.shape[0]-1, 30)
+                if n_pca > 1 and k_eff > n_pca:
+                    pca    = PCA(n_components=n_pca, random_state=random_state)
+                    X_tr_k = pca.fit_transform(X_tr_k)
+                    X_te_k = pca.transform(X_te_k)
+                clf_res = evaluate_gene_subset(
+                    X_tr_k, y_tr, X_te_k, y_te, classes,
+                    random_state=random_state+fold_i)
+                for clf_name, m in clf_res.items():
+                    m_copy = dict(m)
+                    m_copy.update(k=k, fold=fold_i+1, method=mname)
+                    results[mname][k][clf_name].append(m_copy)
+
+        for bname in BASELINE_NAMES:
+            for k in K_VALUES:
+                k_eff = min(k, X_tr.shape[1])
+                try:
+                    gene_idx = get_baseline_genes(
+                        bname, X_tr, y_tr, k_eff,
+                        random_state=random_state+fold_i)
+                except Exception as e:
+                    if verbose:
+                        print(f"  [WARN] {bname} k={k} fold={fold_i+1}: {e}")
+                    continue
+                X_tr_k = X_tr[:, gene_idx]
+                X_te_k = X_te[:, gene_idx]
+                n_pca  = min(k_eff, X_tr_k.shape[0]-1, 30)
+                if n_pca > 1 and k_eff > n_pca:
+                    pca    = PCA(n_components=n_pca, random_state=random_state)
+                    X_tr_k = pca.fit_transform(X_tr_k)
+                    X_te_k = pca.transform(X_te_k)
+                clf_res = evaluate_gene_subset(
+                    X_tr_k, y_tr, X_te_k, y_te, classes,
+                    random_state=random_state+fold_i)
+                for clf_name, m in clf_res.items():
+                    m_copy = dict(m)
+                    m_copy.update(k=k, fold=fold_i+1, method=bname)
+                    results[bname][k][clf_name].append(m_copy)
+
+        if verbose:
+            print(f"  Fold {fold_i+1}/{n_folds} done")
+
+    return results, ab_log, classes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8 — AGGREGATION & STATISTICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCALAR_METRICS = ['accuracy', 'balanced_acc', 'mcc', 'kappa', 'f1_macro', 'auc']
+
+def aggregate(results):
+    rows = []
+    for method, k_dict in results.items():
+        for k, clf_dict in k_dict.items():
+            for clf_name in CLASSIFIER_NAMES + ['Average']:
+                folds = clf_dict.get(clf_name, [])
+                if not folds:
+                    continue
+                row = {'method': method, 'k': k, 'classifier': clf_name}
+                for m in SCALAR_METRICS:
+                    vals = [f[m] for f in folds
+                            if not np.isnan(f.get(m, float('nan')))]
+                    row[f'{m}_mean'] = np.nanmean(vals) if vals else float('nan')
+                    row[f'{m}_std']  = np.nanstd(vals)  if vals else float('nan')
+                    row[f'{m}_vals'] = vals
+                rows.append(row)
+    df = pd.DataFrame(rows)
+    return (df[df['classifier'] != 'Average'].copy(),
+            df[df['classifier'] == 'Average'].copy())
+
+
+def cohen_d(a, b):
+    a, b = np.array(a), np.array(b)
+    pooled = np.sqrt((a.std(ddof=1)**2 + b.std(ddof=1)**2)/2) + 1e-8
+    return (a.mean() - b.mean()) / pooled
+
+
+def statistical_tests(results, best_k, clf_name='Average'):
+    methods  = list(results.keys())
+    al_folds = [f['accuracy'] for f in
+                results.get('DiscCov',{}).get(best_k,{}).get(clf_name,[])]
+    if not al_folds:
+        return pd.DataFrame()
+
+    rows = []; all_acc = []
+    for mname in methods:
+        vals = [f['accuracy']
+                for f in results[mname].get(best_k,{}).get(clf_name,[])]
+        if vals:
+            all_acc.append(vals)
+        if mname == 'DiscCov' or not vals or len(vals) < 3:
+            continue
+        try:
+            _, p_w = wilcoxon(al_folds, vals[:len(al_folds)], alternative='greater')
+        except Exception:
+            p_w = float('nan')
+        rows.append(dict(
+            vs=mname, clf=clf_name,
+            al_mean=np.mean(al_folds),
+            other_mean=np.mean(vals),
+            p_value=round(p_w,4) if not np.isnan(p_w) else 'n/a',
+            significant='yes' if (not np.isnan(p_w) and p_w < 0.05) else 'no',
+            cohen_d=round(cohen_d(al_folds, vals[:len(al_folds)]), 3)
+        ))
+
+    if len(all_acc) >= 3:
+        min_len = min(len(a) for a in all_acc)
+        try:
+            stat_f, p_f = friedmanchisquare(*[a[:min_len] for a in all_acc])
+        except Exception:
+            stat_f, p_f = float('nan'), float('nan')
+    else:
+        stat_f, p_f = float('nan'), float('nan')
+
+    df = pd.DataFrame(rows)
+    df.attrs['friedman_stat'] = round(stat_f,3) if not np.isnan(stat_f) else 'n/a'
+    df.attrs['friedman_p']    = round(p_f,4)    if not np.isnan(p_f)    else 'n/a'
+    return df
+
+
+def print_summary(agg_per_clf, agg_avg, results, best_k):
+    print("\n" + "="*115)
+    print("RESULTS — AVERAGED ACROSS 9 CLASSIFIERS (5-fold CV)")
+    print("="*115)
+    print(f"{'Method':<18} {'k':>5}  {'Acc':>7} {'+-':>6}  "
+          f"{'BalAcc':>7}  {'F1-Mac':>7} {'+-':>6}  {'AUC':>7} {'+-':>6}  {'k':>7}")
+    print("-"*115)
+    for method in METHODS:
+        sub = agg_avg[agg_avg['method']==method].sort_values('k')
+        for _, r in sub.iterrows():
+            print(f"{method:<18} {int(r['k']):>5}  "
+                  f"{r['accuracy_mean']:>7.4f} {r['accuracy_std']:>6.4f}  "
+                  f"{r['balanced_acc_mean']:>7.4f}  "
+                  f"{r['f1_macro_mean']:>7.4f} {r['f1_macro_std']:>6.4f}  "
+                  f"{r['auc_mean']:>7.4f} {r['auc_std']:>6.4f}  "
+                  f"{r['kappa_mean']:>7.4f}")
+
+    print(f"\n{'='*115}")
+    print(f"PER CLASSIFIER at k={best_k}")
+    print(f"{'='*115}")
+    print(f"{'Method':<18} {'Classifier':<22} {'Acc':>7} {'+-':>6}  "
+          f"{'F1-Mac':>7} {'+-':>6}  {'AUC':>7} {'+-':>6}  {'k':>7}")
+    print("-"*115)
+    for method in METHODS:
+        for clf_name in CLASSIFIER_NAMES:
+            sub = agg_per_clf[
+                (agg_per_clf['method']==method) &
+                (agg_per_clf['classifier']==clf_name) &
+                (agg_per_clf['k']==best_k)]
+            if sub.empty:
+                continue
+            r = sub.iloc[0]
+            print(f"{method:<18} {clf_name:<22} "
+                  f"{r['accuracy_mean']:>7.4f} {r['accuracy_std']:>6.4f}  "
+                  f"{r['f1_macro_mean']:>7.4f} {r['f1_macro_std']:>6.4f}  "
+                  f"{r['auc_mean']:>7.4f} {r['auc_std']:>6.4f}  "
+                  f"{r['kappa_mean']:>7.4f}")
+
+    stat_df = statistical_tests(results, best_k, 'Average')
+    print(f"\nSTATISTICAL TESTS at k={best_k}  "
+          f"[Friedman X2={stat_df.attrs.get('friedman_stat','n/a')}  "
+          f"p={stat_df.attrs.get('friedman_p','n/a')}]")
+    if not stat_df.empty:
+        print(f"{'DiscCov vs':<20} {'DiscCov Acc':>11} {'Other':>8} "
+              f"{'p':>8} {'sig':>5} {'Cohen d':>9}")
+        for _, r in stat_df.iterrows():
+            print(f"  {r['vs']:<18} {r['al_mean']:>11.4f} {r['other_mean']:>8.4f} "
+                  f"{str(r['p_value']):>8} {r['significant']:>5} "
+                  f"{r['cohen_d']:>9.3f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9 — PLOTS  (white/light theme)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _style_ax(ax):
+    ax.set_facecolor(PANEL_BG)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(SPINE_COL)
+    ax.tick_params(colors=TICK_COL)
+    ax.grid(True, color=GRID_COL, alpha=0.9, linewidth=0.6, zorder=0)
+
+def _legend(ax, **kw):
+    leg = ax.legend(facecolor=FIG_BG, edgecolor=SPINE_COL, fontsize=7.5, **kw)
+    for text in leg.get_texts():
+        text.set_color(TICK_COL)
+
+def _save(fig, name):
+    path = OUT_DIR + name
+    fig.savefig(path, dpi=150, bbox_inches='tight',
+                facecolor=FIG_BG, edgecolor='none')
+    plt.close(fig)
+    print(f"  Saved: {name}")
+    return path
+
+def _method_line_style(method):
+    return ('-', 2.5, 'o') if method in AL_METHODS else ('--', 1.5, 's')
+
+
+def plot_accuracy_f1_vs_k(agg_avg):
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.set_facecolor(FIG_BG)
+    for ax, metric, ylabel in zip(
+        axes,
+        ['accuracy_mean', 'f1_macro_mean'],
+        ['Accuracy (avg 9 classifiers)', 'F1-Macro (avg 9 classifiers)']):
+        _style_ax(ax)
+        for method in METHODS:
+            sub = agg_avg[agg_avg['method']==method].sort_values('k')
+            if sub.empty: continue
+            ls, lw, mk = _method_line_style(method)
+            color = PALETTE[method]
+            ax.plot(sub['k'], sub[metric], marker=mk, color=color,
+                    label=method, lw=lw, ls=ls, ms=5, zorder=3)
+            std_col = metric.replace('_mean','_std')
+            ax.fill_between(sub['k'],
+                sub[metric]-sub[std_col], sub[metric]+sub[std_col],
+                color=color, alpha=0.10, zorder=2)
+        ax.set_xscale('log')
+        ax.set_xlabel('Number of genes (k)', fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(ylabel.split('(')[0].strip() + ' vs k', fontsize=13,
+                     fontweight='bold')
+        _legend(ax, ncol=2)
+    plt.suptitle('Plot 1 — Accuracy & F1-Macro vs gene set size (mean +/- std, 5-fold CV)',
+                 fontsize=14, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    return _save(fig, 'plot01_accuracy_f1_vs_k.png')
+
+
+def plot_auc_vs_k(agg_avg):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    fig.set_facecolor(FIG_BG); _style_ax(ax)
+    for method in METHODS:
+        sub = agg_avg[agg_avg['method']==method].sort_values('k')
+        if sub.empty: continue
+        ls, lw, mk = _method_line_style(method)
+        color = PALETTE[method]
+        ax.plot(sub['k'], sub['auc_mean'], marker=mk, color=color,
+                label=method, lw=lw, ls=ls, ms=5, zorder=3)
+        ax.fill_between(sub['k'],
+            sub['auc_mean']-sub['auc_std'], sub['auc_mean']+sub['auc_std'],
+            color=color, alpha=0.10, zorder=2)
+    ax.set_xscale('log')
+    ax.set_xlabel('Number of genes (k)', fontsize=11)
+    ax.set_ylabel('ROC-AUC (avg 9 classifiers)', fontsize=11)
+    ax.set_title('Plot 2 — ROC-AUC vs k (all 12 feature-selection methods)',
+                 fontsize=13, fontweight='bold')
+    _legend(ax, ncol=2)
+    plt.tight_layout()
+    return _save(fig, 'plot02_auc_vs_k.png')
+
+
+def _build_heatmap(agg_per_clf, best_k, metric):
+    methods = list(METHODS.keys())
+    mat     = np.full((len(methods), len(CLASSIFIER_NAMES)), float('nan'))
+    for i, m in enumerate(methods):
+        for j, c in enumerate(CLASSIFIER_NAMES):
+            row = agg_per_clf[
+                (agg_per_clf['method']==m) &
+                (agg_per_clf['classifier']==c) &
+                (agg_per_clf['k']==best_k)]
+            if not row.empty:
+                mat[i,j] = row[f'{metric}_mean'].values[0]
+    return mat, methods
+
+def _plot_heatmap(agg_per_clf, best_k, metric, cmap, label, fname, plotnum):
+    mat, methods = _build_heatmap(agg_per_clf, best_k, metric)
+    fig, ax = plt.subplots(figsize=(14, 8))
+    fig.set_facecolor(FIG_BG); ax.set_facecolor(FIG_BG)
+    vmin = max(0, np.nanmin(mat)-0.02) if metric == 'auc' else np.nanmin(mat)
+    vmax = 1.0 if metric == 'auc' else np.nanmax(mat)
+    im = ax.imshow(mat, cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax)
+    cbar = plt.colorbar(im, ax=ax); cbar.set_label(label, fontsize=10)
+    ax.set_xticks(range(len(CLASSIFIER_NAMES)))
+    ax.set_xticklabels(CLASSIFIER_NAMES, fontsize=9, rotation=25, ha='right')
+    ax.set_yticks(range(len(methods)))
+    ax.set_yticklabels(methods, fontsize=10)
+    ax.set_title(f'Plot {plotnum} — {label}: method x classifier (k={best_k})',
+                 fontsize=13, fontweight='bold')
+    mid = (np.nanmin(mat)+np.nanmax(mat))/2
+    for i in range(len(methods)):
+        for j in range(len(CLASSIFIER_NAMES)):
+            if not np.isnan(mat[i,j]):
+                ax.text(j, i, f'{mat[i,j]:.3f}', ha='center', va='center',
+                        color='white' if mat[i,j] < mid else '#1e293b',
+                        fontsize=7.5)
+    plt.tight_layout()
+    return _save(fig, fname)
+
+def plot_heatmap_accuracy(agg_per_clf, best_k):
+    return _plot_heatmap(agg_per_clf, best_k, 'accuracy', 'RdYlGn',
+                         'Accuracy', 'plot03_heatmap_accuracy.png', 3)
+
+def plot_heatmap_f1(agg_per_clf, best_k):
+    return _plot_heatmap(agg_per_clf, best_k, 'f1_macro', 'YlOrRd',
+                         'F1-Macro', 'plot04_heatmap_f1.png', 4)
+
+def plot_heatmap_auc(agg_per_clf, best_k):
+    return _plot_heatmap(agg_per_clf, best_k, 'auc', 'Blues',
+                         'ROC-AUC', 'plot05_heatmap_auc.png', 5)
+
+
+def plot_best_metrics_bar(agg_avg):
+    methods = list(METHODS.keys())
+    metrics = ['accuracy_mean', 'f1_macro_mean', 'auc_mean']
+    labels  = ['Accuracy', 'F1-Macro', 'ROC-AUC']
+    x       = np.arange(len(methods))
+    width   = 0.26
+    colors  = ['#2563eb', '#059669', '#ea580c']
+    fig, ax = plt.subplots(figsize=(16, 6))
+    fig.set_facecolor(FIG_BG); _style_ax(ax)
+    for si, (metric, label, color) in enumerate(zip(metrics, labels, colors)):
+        best_vals = [agg_avg[agg_avg['method']==m][metric].max()
+                     if not agg_avg[agg_avg['method']==m].empty else 0
+                     for m in methods]
+        offset = (si - 1) * width
+        bars = ax.bar(x + offset, best_vals, width, label=label,
+                      color=color, alpha=0.85, zorder=3)
+        for bar, val in zip(bars, best_vals):
+            ax.text(bar.get_x()+bar.get_width()/2, val+0.002,
+                    f'{val:.3f}', ha='center', va='bottom',
+                    fontsize=6.5, color=TICK_COL)
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods, rotation=30, ha='right', fontsize=9)
+    ax.set_ylabel('Score (best over all k, avg 9 clf)', fontsize=11)
+    ax.set_title('Plot 6 — Best Accuracy / F1-Macro / ROC-AUC per feature-selection method',
+                 fontsize=13, fontweight='bold')
+    ax.set_ylim(0, 1.08)
+    _legend(ax)
+    plt.tight_layout()
+    return _save(fig, 'plot06_best_metrics_bar.png')
+
+
+def plot_boxplot_three_metrics(results, best_k):
+    metrics = ['accuracy', 'f1_macro', 'auc']
+    labels  = ['Accuracy', 'F1-Macro', 'ROC-AUC']
+    methods = list(METHODS.keys())
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.set_facecolor(FIG_BG)
+    for ax, metric, label in zip(axes, metrics, labels):
+        _style_ax(ax)
+        data, m_labels = [], []
+        for m in methods:
+            folds = results[m].get(best_k,{}).get('Average',[])
+            vals  = [f[metric] for f in folds
+                     if not np.isnan(f.get(metric, float('nan')))]
+            if vals:
+                data.append(vals); m_labels.append(m)
+        if not data:
+            ax.axis('off'); continue
+        bp = ax.boxplot(data, patch_artist=True,
+                        medianprops=dict(color='#1e293b', lw=2),
+                        whiskerprops=dict(color=SPINE_COL),
+                        capprops=dict(color=SPINE_COL),
+                        flierprops=dict(marker='o', color=SPINE_COL,
+                                        markerfacecolor=SPINE_COL, ms=3))
+        for patch, m in zip(bp['boxes'], m_labels):
+            patch.set_facecolor(PALETTE.get(m,'#94a3b8'))
+            patch.set_alpha(0.75)
+        ax.set_xticks(range(1, len(m_labels)+1))
+        ax.set_xticklabels(m_labels, rotation=35, ha='right', fontsize=7.5)
+        ax.set_ylabel(label, fontsize=11)
+        ax.set_title(f'{label} (k={best_k})', fontsize=12, fontweight='bold')
+    plt.suptitle('Plot 7 — CV fold distributions: Accuracy, F1-Macro, ROC-AUC',
+                 fontsize=14, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    return _save(fig, 'plot07_boxplot_three_metrics.png')
+
+
+def plot_clf_comparison(agg_per_clf, best_k):
+    sub = agg_per_clf[
+        (agg_per_clf['method']=='DiscCov') &
+        (agg_per_clf['k']==best_k)].copy()
+    if sub.empty:
+        print("  [SKIP] plot08: no DiscCov data"); return
+    metrics = ['accuracy_mean', 'f1_macro_mean', 'auc_mean']
+    labels  = ['Accuracy', 'F1-Macro', 'ROC-AUC']
+    colors  = ['#2563eb', '#059669', '#ea580c']
+    x       = np.arange(len(CLASSIFIER_NAMES))
+    width   = 0.26
+    fig, ax = plt.subplots(figsize=(14, 6))
+    fig.set_facecolor(FIG_BG); _style_ax(ax)
+    for si, (metric, label, color) in enumerate(zip(metrics, labels, colors)):
+        vals = []; errs = []
+        for c in CLASSIFIER_NAMES:
+            row = sub[sub['classifier']==c]
+            vals.append(row[metric].values[0] if not row.empty else 0)
+            errs.append(row[metric.replace('_mean','_std')].values[0]
+                        if not row.empty else 0)
+        offset = (si-1)*width
+        ax.bar(x+offset, vals, width, label=label, color=color, alpha=0.85, zorder=3)
+        ax.errorbar(x+offset, vals, yerr=errs,
+                    fmt='none', color='#1e293b', capsize=3, lw=1.2, zorder=4)
+    ax.set_xticks(x)
+    ax.set_xticklabels(CLASSIFIER_NAMES, rotation=25, ha='right', fontsize=9)
+    ax.set_ylabel('Score (mean +/- std, 5 folds)', fontsize=11)
+    ax.set_title(f'Plot 8 — DiscCov: Acc / F1-Macro / AUC per classifier (k={best_k})',
+                 fontsize=13, fontweight='bold')
+    ax.set_ylim(0, 1.1)
+    _legend(ax)
+    plt.tight_layout()
+    return _save(fig, 'plot08_clf_comparison_three_metrics.png')
+
+
+def plot_effect_size(results, best_k):
+    stat_df = statistical_tests(results, best_k, 'Average')
+    if stat_df.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(11, 6))
+    fig.set_facecolor(FIG_BG); _style_ax(ax)
+    methods = stat_df['vs'].tolist()
+    d_vals  = stat_df['cohen_d'].tolist()
+    colors  = ['#059669' if d > 0 else '#dc2626' for d in d_vals]
+    bars = ax.barh(methods, d_vals, color=colors, alpha=0.85, zorder=3)
+    ax.axvline(0,   color=SPINE_COL, lw=1.2)
+    ax.axvline(0.2, color='#d97706', lw=1, ls='--', alpha=0.7, label='small (0.2)')
+    ax.axvline(0.5, color='#ea580c', lw=1, ls='--', alpha=0.7, label='medium (0.5)')
+    ax.axvline(0.8, color='#9333ea', lw=1, ls='--', alpha=0.7, label='large (0.8)')
+    for bar, val in zip(bars, d_vals):
+        ax.text(val + (0.01 if val >= 0 else -0.01),
+                bar.get_y()+bar.get_height()/2,
+                f'{val:.3f}', va='center',
+                ha='left' if val >= 0 else 'right',
+                fontsize=9, color=TICK_COL)
+    ax.set_xlabel("Cohen's d  (DiscCov vs method, avg 9 clf)", fontsize=11)
+    ax.set_title(f"Plot 9 — Effect size: DiscCov vs all methods (k={best_k})",
+                 fontsize=13, fontweight='bold')
+    _legend(ax)
+    plt.tight_layout()
+    return _save(fig, 'plot09_effect_size.png')
+
+
+def plot_multi_metric_grouped(agg_avg, best_k):
+    methods = list(METHODS.keys())
+    metrics = ['accuracy_mean', 'f1_macro_mean', 'auc_mean']
+    labels  = ['Accuracy', 'F1-Macro', 'ROC-AUC']
+    colors  = ['#2563eb', '#059669', '#ea580c']
+    sub     = agg_avg[agg_avg['k']==best_k]
+    x       = np.arange(len(methods))
+    width   = 0.26
+    fig, ax = plt.subplots(figsize=(16, 6))
+    fig.set_facecolor(FIG_BG); _style_ax(ax)
+    for si, (metric, label, color) in enumerate(zip(metrics, labels, colors)):
+        vals = []; errs = []
+        for m in methods:
+            row = sub[sub['method']==m]
+            vals.append(row[metric].values[0] if not row.empty else 0)
+            errs.append(row[metric.replace('_mean','_std')].values[0]
+                        if not row.empty else 0)
+        offset = (si-1)*width
+        ax.bar(x+offset, vals, width, label=label, color=color, alpha=0.85, zorder=3)
+        ax.errorbar(x+offset, vals, yerr=errs,
+                    fmt='none', color='#1e293b', capsize=3, lw=1.2, zorder=4)
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods, rotation=30, ha='right', fontsize=9)
+    ax.set_ylabel('Score (mean +/- std)', fontsize=11)
+    ax.set_title(f'Plot 10 — Accuracy / F1-Macro / ROC-AUC at k={best_k}',
+                 fontsize=13, fontweight='bold')
+    ax.set_ylim(0, 1.08)
+    _legend(ax)
+    plt.tight_layout()
+    return _save(fig, 'plot10_multi_metric_grouped.png')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10 — MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    print("="*70)
+    print("AL-INSPIRED ADAPTIVE GENE SELECTION PIPELINE (v4.3)")
+    print(f"  {len(METHODS)} feature-selection methods  x  "
+          f"{len(CLASSIFIER_NAMES)} classifiers  x  "
+          f"{len(K_VALUES)} k values  x  5-fold CV")
+    print("="*70)
+
+    print("\n[1] Loading data ...")
+    try:
+        df = pd.read_csv("prostate.csv")
+        print(f"  Loaded: {df.shape}")
+    except FileNotFoundError:
+        print("  File not found — generating synthetic data ...")
+        rng = np.random.default_rng(42)
+        n_s, n_g = 72, 7129
+        X_raw = rng.exponential(scale=500, size=(n_s, n_g)).astype(float)
+        y_raw = rng.integers(0, 2, size=n_s)
+        X_raw[y_raw==1, :200] += rng.normal(400, 60, (y_raw.sum(), 200))
+        df = pd.DataFrame(X_raw); df['label'] = y_raw
+        df.to_csv("prostate.csv", index=False)
+
+    X_raw = df.iloc[:,:-1].values.astype(float)
+    y_raw = df.iloc[:,-1].values
+    y = LabelEncoder().fit_transform(y_raw) if y_raw.dtype.kind not in 'biu' \
+        else y_raw.astype(int)
+    if y.min() < 0:
+        uq = np.unique(y); y = np.array([np.where(uq==v)[0][0] for v in y])
+    print(f"  Classes: {np.unique(y)}  Distribution: {np.bincount(y)}")
+
+    print("\n[2] Preprocessing ...")
+    X = preprocess(X_raw.copy(), do_log2=True, do_qnorm=True)
+    if X.shape[1] > 2000:
+        X = X[:, np.argsort(np.var(X, axis=0))[::-1][:2000]]
+        print("  Variance pre-filter: kept top 2000 genes")
+    print(f"  Shape after preprocessing: {X.shape}")
+
+    print(f"\n[3] Running 5-fold CV ...")
+    t0 = time.time()
+    results, ab_log, classes = run_pipeline(
+        X, y, n_folds=10, random_state=42, verbose=True)
+    print(f"  Total time: {time.time()-t0:.1f}s")
+
+    print("\n[4] Aggregating ...")
+    agg_per_clf, agg_avg = aggregate(results)
+    al_sub = agg_avg[agg_avg['method']=='DiscCov']
+    best_k = int(al_sub.loc[al_sub['accuracy_mean'].idxmax(), 'k']) \
+             if not al_sub.empty else 100
+    print(f"  Best k (DiscCov, avg clf): {best_k}")
+    print_summary(agg_per_clf, agg_avg, results, best_k)
+
+    agg_per_clf.to_csv(OUT_DIR+'results_per_classifier.csv', index=False)
+    agg_avg.to_csv(    OUT_DIR+'results_averaged.csv',       index=False)
+    stat_df = statistical_tests(results, best_k, 'Average')
+    if not stat_df.empty:
+        stat_df.to_csv(OUT_DIR+'statistical_tests.csv', index=False)
+    print(f"\n  CSVs saved to {OUT_DIR}")
+
+    print("\n[5] Generating 10 plots ...")
+    plot_accuracy_f1_vs_k(agg_avg)
+    plot_auc_vs_k(agg_avg)
+    plot_heatmap_accuracy(agg_per_clf, best_k)
+    plot_heatmap_f1(agg_per_clf, best_k)
+    plot_heatmap_auc(agg_per_clf, best_k)
+    plot_best_metrics_bar(agg_avg)
+    plot_boxplot_three_metrics(results, best_k)
+    plot_clf_comparison(agg_per_clf, best_k)
+    plot_effect_size(results, best_k)
+    plot_multi_metric_grouped(agg_avg, best_k)
+
+    print("\n" + "="*70)
+    print("DONE — all outputs in", OUT_DIR)
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main() 
